@@ -1,4 +1,4 @@
-name: Cut a new tag (also auto updates package.json and package-lock.json)
+name: Cut a new tag (also auto updates package.json, package-lock.json, manifest.json and changelogs)
 
 on:
   workflow_dispatch:
@@ -11,10 +11,15 @@ on:
 jobs:
   bump-version:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v3
+      with:
+        # Full history and tags are needed to list the commits since the last release
+        fetch-depth: 0
 
     - name: Set up Node.js
       uses: actions/setup-node@v3
@@ -28,17 +33,114 @@ jobs:
           user_email="github-actions@github.com"
         fi
         echo "user_email=$user_email" >> $GITHUB_ENV
-    
+
     - name: Configure Git with the triggering user's info
       run: |
         git config user.name "${{ github.actor }}"
         git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
 
-
-    - name: Bump version and push tag
+    - name: Bump version in package.json and package-lock.json
       run: |
+        set -euo pipefail
+
         npm install
-        npm version ${{ github.event.inputs.release_type }} -m "chore: bump version to %s"
+        npm version ${{ github.event.inputs.release_type }} --no-git-tag-version
+
+        NEW_VERSION=$(node -p "require('./package.json').version")
+        PREVIOUS_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+        echo "New version is: $NEW_VERSION (previous tag: ${PREVIOUS_TAG:-none})"
+
+        echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+        echo "PREVIOUS_TAG=$PREVIOUS_TAG" >> $GITHUB_ENV
+
+    - name: Set version in manifest.json
+      run: |
+        set -euo pipefail
+
+        jq --arg v "$NEW_VERSION" '.version = $v' manifest.json > manifest.json.tmp
+        mv manifest.json.tmp manifest.json
+
+    - name: Collect changes since the previous tag
+      run: |
+        set -euo pipefail
+
+        RELEASE_NOTES="$RUNNER_TEMP/release-notes.txt"
+        git log --no-merges --format='%s' ${PREVIOUS_TAG:+"$PREVIOUS_TAG"..}HEAD \
+          | { grep -v '^chore: bump version to' || true; } > "$RELEASE_NOTES"
+        if [ ! -s "$RELEASE_NOTES" ]; then
+          echo "chore: release v$NEW_VERSION" > "$RELEASE_NOTES"
+        fi
+        cat "$RELEASE_NOTES"
+
+        echo "RELEASE_NOTES=$RELEASE_NOTES" >> $GITHUB_ENV
+
+    - name: Update CHANGELOG.md
+      if: hashFiles('CHANGELOG.md') != ''
+      run: |
+        set -euo pipefail
+
+        if grep -qE "^#+ v?${NEW_VERSION//./\\.}[[:space:]]*$" CHANGELOG.md; then
+          echo "CHANGELOG.md already has an entry for v$NEW_VERSION, leaving it untouched"
+          exit 0
+        fi
+
+        # Follow the heading level and bullet style already used by the file
+        HEADING=$(grep -m1 -oE '^#+ v?[0-9]' CHANGELOG.md | grep -oE '^#+' || echo '##')
+        BULLET=$(grep -m1 -oE '^[*-] ' CHANGELOG.md | cut -c1 || echo '*')
+
+        ENTRY="$RUNNER_TEMP/changelog-entry.md"
+        {
+          echo "$HEADING v$NEW_VERSION"
+          echo
+          sed "s/^/$BULLET /" "$RELEASE_NOTES"
+        } > "$ENTRY"
+
+        awk -v entry="$ENTRY" '
+          function print_entry() { while ((getline line < entry) > 0) print line; print ""; inserted = 1 }
+          !inserted && /^#+ v?[0-9]/ { print_entry() }
+          { print }
+          END { if (!inserted) { print ""; print_entry() } }
+        ' CHANGELOG.md > CHANGELOG.md.tmp
+        mv CHANGELOG.md.tmp CHANGELOG.md
+
+    - name: Update debian/changelog
+      if: hashFiles('debian/changelog') != ''
+      run: |
+        set -euo pipefail
+
+        if head -n1 debian/changelog | grep -qF "($NEW_VERSION)"; then
+          echo "debian/changelog already has an entry for $NEW_VERSION, leaving it untouched"
+          exit 0
+        fi
+
+        PACKAGE=$(head -n1 debian/changelog | cut -d' ' -f1)
+        DISTRIBUTION=$(head -n1 debian/changelog | sed -E 's/^[^)]*\) ([^;]+);.*/\1/')
+        MAINTAINER=$(grep -m1 '^ -- ' debian/changelog | sed -E 's/^ -- (.*>).*/\1/')
+
+        {
+          echo "$PACKAGE ($NEW_VERSION) $DISTRIBUTION; urgency=medium"
+          echo
+          sed 's/^/  * /' "$RELEASE_NOTES"
+          echo
+          echo " -- $MAINTAINER  $(date -R)"
+          echo
+          cat debian/changelog
+        } > debian/changelog.tmp
+        mv debian/changelog.tmp debian/changelog
+
+    - name: Commit, tag and push
+      run: |
+        set -euo pipefail
+
+        git add package.json package-lock.json manifest.json
+        for changelog in CHANGELOG.md debian/changelog; do
+          if [ -f "$changelog" ]; then
+            git add "$changelog"
+          fi
+        done
+
+        git commit -m "chore: bump version to $NEW_VERSION"
+        git tag -a "v$NEW_VERSION" -m "v$NEW_VERSION"
         git push --follow-tags
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
